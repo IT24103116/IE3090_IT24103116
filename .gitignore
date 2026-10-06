@@ -57,3 +57,4 @@ agentfiles/
 *.o
 agent_116
 controller_116
+*.log
