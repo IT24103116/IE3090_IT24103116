@@ -4,21 +4,56 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <time.h>
+#include <stdarg.h>
+#include <pthread.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#define PORT    9410         /* 7000 + 2410 (IT24103116) */
-#define BACKLOG 10
-#define SID     "6113"       /* last 4 digits 3116 reversed */
-#define TOKEN   "OPS-3116"   /* OPS- + last 4 digits */
-#define BUFSZ   8192
+#define PORT     9410                    /* 7000 + 2410 (IT24103116) */
+#define BACKLOG  10
+#define SID      "6113"                  /* last 4 digits 3116 reversed */
+#define TOKEN    "OPS-3116"              /* OPS- + last 4 digits */
+#define LOGFILE  "remoteops_IT24103116.log"
+#define BUFSZ    8192
+
+/* ---------- logging (thread-safe) ---------- */
+static FILE *logfp = NULL;
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void log_event(const char *fmt, ...)
+{
+    char ts[32];
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+
+    pthread_mutex_lock(&log_mutex);
+    if (logfp) {
+        va_list ap;
+        fprintf(logfp, "%s ", ts);
+        va_start(ap, fmt);
+        vfprintf(logfp, fmt, ap);
+        va_end(ap);
+        fprintf(logfp, "\n");
+        fflush(logfp);
+    }
+    pthread_mutex_unlock(&log_mutex);
+}
 
 struct conn {
     int    fd;
     char   buf[BUFSZ];
     size_t len;
     int    authed;
+};
+
+struct client_arg {
+    int  fd;
+    char ip[INET_ADDRSTRLEN];
+    int  port;
 };
 
 static int send_all(int fd, const char *data, size_t n)
@@ -71,7 +106,7 @@ static int read_line(struct conn *c, char *line, size_t max)
     }
 }
 
-/* ---------- SYSINFO: CPU load, memory used (MB), uptime (s) ---------- */
+/* ---------- SYSINFO ---------- */
 static void get_sysinfo(char *out, size_t n)
 {
     double load = 0.0, up = 0.0;
@@ -107,7 +142,7 @@ static void get_sysinfo(char *out, size_t n)
     snprintf(out, n, "SYSINFO %.2f %ld %ld", load, used_mb, (long)up);
 }
 
-/* ---------- LISTPROC: snapshot as pid:name,pid:name,... ---------- */
+/* ---------- LISTPROC ---------- */
 static void list_procs(char *out, size_t n)
 {
     out[0] = '\0';
@@ -134,8 +169,7 @@ static void list_procs(char *out, size_t n)
     pclose(p);
 }
 
-/* Run a FIXED command string (never user input) and flatten the output
-   to one line. */
+/* Run a FIXED command string (never user input), flatten to one line. */
 static void run_cmd(const char *cmd, char *out, size_t n)
 {
     out[0] = '\0';
@@ -196,15 +230,20 @@ static void handle_client(int fd, const char *ip, int port)
             if (strncmp(line, "AUTH ", 5) == 0) {
                 if (strcmp(line + 5, TOKEN) == 0) {
                     c.authed = 1;
+                    log_event("[%s:%d] AUTH success", ip, port);
                     reply(&c, "OK AUTHENTICATED");
                 } else {
+                    log_event("[%s:%d] AUTH failed", ip, port);
                     reply(&c, "ERR 001 AUTH_FAILED");
                 }
             } else {
+                log_event("[%s:%d] rejected before AUTH: %s", ip, port, line);
                 reply(&c, "ERR 003 NOT_AUTHENTICATED");
             }
             continue;
         }
+
+        log_event("[%s:%d] CMD %s", ip, port, line);
 
         if (strcmp(line, "QUIT") == 0) {
             reply(&c, "OK BYE");
@@ -228,14 +267,34 @@ static void handle_client(int fd, const char *ip, int port)
         }
     }
 
-    if (r == 0)      printf("[%s:%d] client disconnected\n", ip, port);
-    else if (r < 0)  printf("[%s:%d] read error, closing\n", ip, port);
+    if (r == 0) {
+        printf("[%s:%d] client disconnected\n", ip, port);
+        log_event("[%s:%d] DISCONNECT (client closed)", ip, port);
+    } else if (r < 0) {
+        printf("[%s:%d] read error, closing\n", ip, port);
+        log_event("[%s:%d] DISCONNECT (read error)", ip, port);
+    } else {
+        log_event("[%s:%d] DISCONNECT (QUIT)", ip, port);
+    }
     close(fd);
+}
+
+/* One thread per client connection. */
+static void *client_thread(void *p)
+{
+    struct client_arg *a = (struct client_arg *)p;
+    pthread_detach(pthread_self());     /* resources freed automatically */
+    handle_client(a->fd, a->ip, a->port);
+    free(a);
+    return NULL;
 }
 
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
+
+    logfp = fopen(LOGFILE, "a");
+    if (!logfp) { perror("log file"); return 1; }
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("socket"); return 1; }
@@ -259,6 +318,7 @@ int main(void)
     }
 
     printf("RemoteOps Agent listening on port %d\n", PORT);
+    log_event("Agent started, listening on port %d", PORT);
 
     while (1) {
         struct sockaddr_in cli;
@@ -268,10 +328,22 @@ int main(void)
             perror("accept");
             continue;
         }
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &cli.sin_addr, ip, sizeof(ip));
-        printf("Connection from %s:%d\n", ip, ntohs(cli.sin_port));
 
-        handle_client(cfd, ip, ntohs(cli.sin_port));
+        struct client_arg *a = malloc(sizeof(*a));
+        if (!a) { close(cfd); continue; }
+        a->fd = cfd;
+        inet_ntop(AF_INET, &cli.sin_addr, a->ip, sizeof(a->ip));
+        a->port = ntohs(cli.sin_port);
+
+        printf("Connection from %s:%d\n", a->ip, a->port);
+        log_event("[%s:%d] CONNECT", a->ip, a->port);
+
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, client_thread, a) != 0) {
+            perror("pthread_create");
+            log_event("[%s:%d] thread creation failed", a->ip, a->port);
+            close(cfd);
+            free(a);
+        }
     }
 }
