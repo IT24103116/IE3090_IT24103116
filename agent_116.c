@@ -14,9 +14,6 @@
 #define TOKEN   "OPS-3116"   /* OPS- + last 4 digits */
 #define BUFSZ   8192
 
-/* One of these per connection. buf holds bytes received but not yet
-   consumed, so leftover data (half a line, or the start of the next
-   line) is never lost. It also lets PUT read file bytes later. */
 struct conn {
     int    fd;
     char   buf[BUFSZ];
@@ -24,7 +21,6 @@ struct conn {
     int    authed;
 };
 
-/* Send exactly n bytes, however many send() calls it takes. */
 static int send_all(int fd, const char *data, size_t n)
 {
     size_t sent = 0;
@@ -42,14 +38,12 @@ static int send_all(int fd, const char *data, size_t n)
 /* Every response ends with " SID:<sid>" and a newline. */
 static int reply(struct conn *c, const char *msg)
 {
-    char out[1024];
+    char out[8192];
     int n = snprintf(out, sizeof(out), "%s SID:%s\n", msg, SID);
     if (n < 0 || n >= (int)sizeof(out)) return -1;
     return send_all(c->fd, out, (size_t)n);
 }
 
-/* Read one full line (without the newline) into line.
-   Returns 1 = got a line, 0 = client closed, -1 = error. */
 static int read_line(struct conn *c, char *line, size_t max)
 {
     while (1) {
@@ -66,7 +60,7 @@ static int read_line(struct conn *c, char *line, size_t max)
             c->len -= consumed;
             return 1;
         }
-        if (c->len == BUFSZ) return -1;   /* line too long */
+        if (c->len == BUFSZ) return -1;
         ssize_t r = recv(c->fd, c->buf + c->len, BUFSZ - c->len, 0);
         if (r == 0) return 0;
         if (r < 0) {
@@ -75,6 +69,116 @@ static int read_line(struct conn *c, char *line, size_t max)
         }
         c->len += (size_t)r;
     }
+}
+
+/* ---------- SYSINFO: CPU load, memory used (MB), uptime (s) ---------- */
+static void get_sysinfo(char *out, size_t n)
+{
+    double load = 0.0, up = 0.0;
+    long mem_total = 0, mem_avail = 0;
+    FILE *f;
+
+    f = fopen("/proc/loadavg", "r");
+    if (f) {
+        if (fscanf(f, "%lf", &load) != 1) load = 0.0;
+        fclose(f);
+    }
+
+    f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char key[64];
+        long val;
+        while (fscanf(f, "%63s %ld", key, &val) == 2) {
+            if (strcmp(key, "MemTotal:") == 0) mem_total = val;
+            else if (strcmp(key, "MemAvailable:") == 0) mem_avail = val;
+            int ch;
+            while ((ch = fgetc(f)) != '\n' && ch != EOF) { }
+        }
+        fclose(f);
+    }
+
+    f = fopen("/proc/uptime", "r");
+    if (f) {
+        if (fscanf(f, "%lf", &up) != 1) up = 0.0;
+        fclose(f);
+    }
+
+    long used_mb = (mem_total - mem_avail) / 1024;
+    snprintf(out, n, "SYSINFO %.2f %ld %ld", load, used_mb, (long)up);
+}
+
+/* ---------- LISTPROC: snapshot as pid:name,pid:name,... ---------- */
+static void list_procs(char *out, size_t n)
+{
+    out[0] = '\0';
+    FILE *p = popen("ps -eo pid=,comm=", "r");
+    if (!p) {
+        snprintf(out, n, "unavailable");
+        return;
+    }
+    char line[256];
+    size_t used = 0;
+    int first = 1;
+    while (fgets(line, sizeof(line), p)) {
+        int pid;
+        char name[128];
+        if (sscanf(line, "%d %127s", &pid, name) != 2) continue;
+        char item[160];
+        int w = snprintf(item, sizeof(item), "%s%d:%s", first ? "" : ",", pid, name);
+        if (w < 0 || used + (size_t)w + 1 >= n) break;
+        memcpy(out + used, item, (size_t)w);
+        used += (size_t)w;
+        out[used] = '\0';
+        first = 0;
+    }
+    pclose(p);
+}
+
+/* Run a FIXED command string (never user input) and flatten the output
+   to one line. */
+static void run_cmd(const char *cmd, char *out, size_t n)
+{
+    out[0] = '\0';
+    FILE *p = popen(cmd, "r");
+    if (!p) {
+        snprintf(out, n, "error");
+        return;
+    }
+    size_t used = 0;
+    int ch;
+    while ((ch = fgetc(p)) != EOF && used + 1 < n) {
+        out[used++] = (ch == '\n' || ch == '\r') ? ' ' : (char)ch;
+    }
+    out[used] = '\0';
+    pclose(p);
+    while (used > 0 && out[used - 1] == ' ')
+        out[--used] = '\0';
+}
+
+/* ---------- EXEC: fixed whitelist, exact match only ---------- */
+static void handle_exec(struct conn *c, const char *name)
+{
+    static const struct {
+        const char *name;
+        const char *cmd;
+    } table[] = {
+        { "DATE",     "date"     },
+        { "UPTIME",   "uptime"   },
+        { "DISKFREE", "df -h /"  },
+        { "HOSTNAME", "hostname" },
+        { "WHOAMI",   "whoami"   },
+    };
+
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        if (strcmp(name, table[i].name) == 0) {
+            char out[2048], msg[2100];
+            run_cmd(table[i].cmd, out, sizeof(out));
+            snprintf(msg, sizeof(msg), "OK EXEC_RESULT %s", out);
+            reply(c, msg);
+            return;
+        }
+    }
+    reply(c, "ERR 002 COMMAND_NOT_ALLOWED");
 }
 
 static void handle_client(int fd, const char *ip, int port)
@@ -89,7 +193,6 @@ static void handle_client(int fd, const char *ip, int port)
         printf("[%s:%d] > %s\n", ip, port, line);
 
         if (!c.authed) {
-            /* Only AUTH is accepted until it succeeds. */
             if (strncmp(line, "AUTH ", 5) == 0) {
                 if (strcmp(line + 5, TOKEN) == 0) {
                     c.authed = 1;
@@ -108,8 +211,20 @@ static void handle_client(int fd, const char *ip, int port)
             break;
         } else if (strncmp(line, "AUTH ", 5) == 0) {
             reply(&c, "OK AUTHENTICATED");
+        } else if (strcmp(line, "SYSINFO") == 0) {
+            char info[256], msg[300];
+            get_sysinfo(info, sizeof(info));
+            snprintf(msg, sizeof(msg), "OK %s", info);
+            reply(&c, msg);
+        } else if (strcmp(line, "LISTPROC") == 0) {
+            char procs[6000], msg[6100];
+            list_procs(procs, sizeof(procs));
+            snprintf(msg, sizeof(msg), "OK PROCS %s", procs);
+            reply(&c, msg);
+        } else if (strncmp(line, "EXEC ", 5) == 0) {
+            handle_exec(&c, line + 5);
         } else {
-            reply(&c, "ERR 099 UNKNOWN_COMMAND");   /* handlers come next */
+            reply(&c, "ERR 099 UNKNOWN_COMMAND");
         }
     }
 
@@ -120,7 +235,7 @@ static void handle_client(int fd, const char *ip, int port)
 
 int main(void)
 {
-    signal(SIGPIPE, SIG_IGN);   /* a dead client must not kill the agent */
+    signal(SIGPIPE, SIG_IGN);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("socket"); return 1; }
