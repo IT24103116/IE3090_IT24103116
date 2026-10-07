@@ -6,17 +6,23 @@
 #include <signal.h>
 #include <time.h>
 #include <stdarg.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#define PORT     9410                    /* 7000 + 2410 (IT24103116) */
-#define BACKLOG  10
-#define SID      "6113"                  /* last 4 digits 3116 reversed */
-#define TOKEN    "OPS-3116"              /* OPS- + last 4 digits */
-#define LOGFILE  "remoteops_IT24103116.log"
-#define BUFSZ    8192
+#define PORT       9410                    /* 7000 + 2410 (IT24103116) */
+#define BACKLOG    10
+#define SID        "6113"                  /* last 4 digits 3116 reversed */
+#define TOKEN      "OPS-3116"              /* OPS- + last 4 digits */
+#define LOGFILE    "remoteops_IT24103116.log"
+#define STORE_DIR  "agentfiles/IT24103116" /* ./agentfiles/<regno>/ */
+#define MAX_FILE   (50ULL * 1024 * 1024)   /* uploads above 50 MB are refused */
+#define MAX_DRAIN  (1024ULL * 1024 * 1024) /* above 1 GB we close instead of draining */
+#define BUFSZ      8192
 
 /* ---------- logging (thread-safe) ---------- */
 static FILE *logfp = NULL;
@@ -43,9 +49,16 @@ static void log_event(const char *fmt, ...)
     pthread_mutex_unlock(&log_mutex);
 }
 
+static double now_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
 struct conn {
     int    fd;
-    char   buf[BUFSZ];
+    char   buf[BUFSZ];   /* bytes received but not yet consumed */
     size_t len;
     int    authed;
 };
@@ -56,6 +69,7 @@ struct client_arg {
     int  port;
 };
 
+/* ---------- low-level helpers ---------- */
 static int send_all(int fd, const char *data, size_t n)
 {
     size_t sent = 0;
@@ -70,6 +84,20 @@ static int send_all(int fd, const char *data, size_t n)
     return 0;
 }
 
+static int write_all(int fd, const char *data, size_t n)
+{
+    size_t done = 0;
+    while (done < n) {
+        ssize_t w = write(fd, data + done, n - done);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        done += (size_t)w;
+    }
+    return 0;
+}
+
 /* Every response ends with " SID:<sid>" and a newline. */
 static int reply(struct conn *c, const char *msg)
 {
@@ -79,6 +107,7 @@ static int reply(struct conn *c, const char *msg)
     return send_all(c->fd, out, (size_t)n);
 }
 
+/* One full line (without the newline). 1 = line, 0 = closed, -1 = error. */
 static int read_line(struct conn *c, char *line, size_t max)
 {
     while (1) {
@@ -104,6 +133,36 @@ static int read_line(struct conn *c, char *line, size_t max)
         }
         c->len += (size_t)r;
     }
+}
+
+/* Consume exactly n bytes from the connection. Bytes already sitting in
+   c->buf (they arrived in the same recv() as the command line) are used
+   first. If out_fd >= 0 they are written there, otherwise discarded.
+   Returns 0 on success, -1 on error or early disconnect. */
+static int recv_bytes(struct conn *c, int out_fd, unsigned long long n)
+{
+    char tmp[BUFSZ];
+    while (n > 0) {
+        size_t chunk;
+        if (c->len > 0) {
+            chunk = c->len < n ? c->len : (size_t)n;
+            if (out_fd >= 0 && write_all(out_fd, c->buf, chunk) < 0) return -1;
+            memmove(c->buf, c->buf + chunk, c->len - chunk);
+            c->len -= chunk;
+        } else {
+            size_t want = n < sizeof(tmp) ? (size_t)n : sizeof(tmp);
+            ssize_t r = recv(c->fd, tmp, want, 0);
+            if (r == 0) return -1;
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            chunk = (size_t)r;
+            if (out_fd >= 0 && write_all(out_fd, tmp, chunk) < 0) return -1;
+        }
+        n -= chunk;
+    }
+    return 0;
 }
 
 /* ---------- SYSINFO ---------- */
@@ -215,6 +274,170 @@ static void handle_exec(struct conn *c, const char *name)
     reply(c, "ERR 002 COMMAND_NOT_ALLOWED");
 }
 
+/* ---------- file transfer helpers ---------- */
+static int make_store_dir(void)
+{
+    if (mkdir("agentfiles", 0755) < 0 && errno != EEXIST) return -1;
+    if (mkdir(STORE_DIR, 0755) < 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+/* Letters, digits, '.', '_', '-' only; must not start with '.'.
+   This blocks "../x" and any path separator. */
+static int valid_filename(const char *s)
+{
+    size_t len = strlen(s);
+    if (len == 0 || len > 100) return 0;
+    if (s[0] == '.') return 0;
+    for (size_t i = 0; i < len; i++) {
+        char ch = s[i];
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+              (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-'))
+            return 0;
+    }
+    return 1;
+}
+
+/* Digits only, at most 18 of them (so it cannot overflow). */
+static int parse_size(const char *s, unsigned long long *out)
+{
+    if (*s == '\0' || strlen(s) > 18) return -1;
+    unsigned long long v = 0;
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9') return -1;
+        v = v * 10 + (unsigned long long)(*s - '0');
+    }
+    *out = v;
+    return 0;
+}
+
+/* PUT <filename> <filesize> + exactly <filesize> raw bytes.
+   Returns 0 to keep the connection, -1 to close it. */
+static int handle_put(struct conn *c, const char *ip, int port, const char *args)
+{
+    char name[256], sizestr[64], extra[8];
+    unsigned long long size;
+
+    if (sscanf(args, "%255s %63s %7s", name, sizestr, extra) != 2 ||
+        parse_size(sizestr, &size) < 0) {
+        reply(c, "ERR 007 BAD_REQUEST");
+        return 0;
+    }
+
+    if (size > MAX_FILE) {
+        log_event("[%s:%d] PUT %s rejected: %llu bytes is over the limit",
+                  ip, port, name, size);
+        int keep = (size <= MAX_DRAIN && recv_bytes(c, -1, size) == 0);
+        reply(c, "ERR 004 FILE_TOO_LARGE");
+        return keep ? 0 : -1;
+    }
+
+    if (!valid_filename(name)) {
+        log_event("[%s:%d] PUT rejected: invalid file name", ip, port);
+        int keep = (recv_bytes(c, -1, size) == 0);
+        reply(c, "ERR 006 INVALID_FILENAME");
+        return keep ? 0 : -1;
+    }
+
+    char path[512], tmp[560];
+    snprintf(path, sizeof(path), "%s/%s", STORE_DIR, name);
+    snprintf(tmp, sizeof(tmp), "%s.part%d", path, c->fd);
+
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        log_event("[%s:%d] PUT %s failed: cannot create file (%s)",
+                  ip, port, name, strerror(errno));
+        int keep = (recv_bytes(c, -1, size) == 0);
+        reply(c, "ERR 008 STORAGE_ERROR");
+        return keep ? 0 : -1;
+    }
+
+    double t0 = now_sec();
+    int rc = recv_bytes(c, fd, size);
+    double dt = now_sec() - t0;
+    close(fd);
+
+    if (rc < 0) {
+        unlink(tmp);   /* never leave a half-written file behind */
+        log_event("[%s:%d] PUT %s aborted (client dropped or write error)",
+                  ip, port, name);
+        return -1;
+    }
+    if (rename(tmp, path) < 0) {
+        unlink(tmp);
+        log_event("[%s:%d] PUT %s failed: rename (%s)", ip, port, name, strerror(errno));
+        reply(c, "ERR 008 STORAGE_ERROR");
+        return 0;
+    }
+
+    if (dt < 1e-6) dt = 1e-6;
+    log_event("[%s:%d] FILE_PUT %s %llu bytes in %.3f s (%.0f B/s)",
+              ip, port, name, size, dt, (double)size / dt);
+
+    char msg[400];
+    snprintf(msg, sizeof(msg), "OK FILE_RECEIVED %s", name);
+    reply(c, msg);
+    return 0;
+}
+
+/* GET <filename>. Returns 0 to keep the connection, -1 to close it. */
+static int handle_get(struct conn *c, const char *ip, int port, const char *args)
+{
+    char name[256], extra[8];
+
+    if (sscanf(args, "%255s %7s", name, extra) != 1) {
+        reply(c, "ERR 007 BAD_REQUEST");
+        return 0;
+    }
+    if (!valid_filename(name)) {
+        reply(c, "ERR 006 INVALID_FILENAME");
+        return 0;
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", STORE_DIR, name);
+
+    struct stat st;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0 || fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        if (fd >= 0) close(fd);
+        log_event("[%s:%d] GET %s: file not found", ip, port, name);
+        reply(c, "ERR 005 FILE_NOT_FOUND");
+        return 0;
+    }
+    unsigned long long size = (unsigned long long)st.st_size;
+
+    char msg[400];
+    snprintf(msg, sizeof(msg), "OK FILE_SEND %s %llu", name, size);
+    if (reply(c, msg) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    double t0 = now_sec();
+    char tmp[BUFSZ];
+    unsigned long long left = size;
+    while (left > 0) {
+        size_t want = left < sizeof(tmp) ? (size_t)left : sizeof(tmp);
+        ssize_t r = read(fd, tmp, want);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0 || send_all(c->fd, tmp, (size_t)r) < 0) {
+            close(fd);
+            log_event("[%s:%d] GET %s aborted mid-transfer", ip, port, name);
+            return -1;   /* we promised <size> bytes and cannot deliver them */
+        }
+        left -= (unsigned long long)r;
+    }
+    close(fd);
+
+    double dt = now_sec() - t0;
+    if (dt < 1e-6) dt = 1e-6;
+    log_event("[%s:%d] FILE_GET %s %llu bytes in %.3f s (%.0f B/s)",
+              ip, port, name, size, dt, (double)size / dt);
+    return 0;
+}
+
+/* ---------- one client session ---------- */
 static void handle_client(int fd, const char *ip, int port)
 {
     struct conn c;
@@ -262,6 +485,10 @@ static void handle_client(int fd, const char *ip, int port)
             reply(&c, msg);
         } else if (strncmp(line, "EXEC ", 5) == 0) {
             handle_exec(&c, line + 5);
+        } else if (strncmp(line, "PUT ", 4) == 0) {
+            if (handle_put(&c, ip, port, line + 4) < 0) { r = -1; break; }
+        } else if (strncmp(line, "GET ", 4) == 0) {
+            if (handle_get(&c, ip, port, line + 4) < 0) { r = -1; break; }
         } else {
             reply(&c, "ERR 099 UNKNOWN_COMMAND");
         }
@@ -271,8 +498,8 @@ static void handle_client(int fd, const char *ip, int port)
         printf("[%s:%d] client disconnected\n", ip, port);
         log_event("[%s:%d] DISCONNECT (client closed)", ip, port);
     } else if (r < 0) {
-        printf("[%s:%d] read error, closing\n", ip, port);
-        log_event("[%s:%d] DISCONNECT (read error)", ip, port);
+        printf("[%s:%d] connection error, closing\n", ip, port);
+        log_event("[%s:%d] DISCONNECT (error)", ip, port);
     } else {
         log_event("[%s:%d] DISCONNECT (QUIT)", ip, port);
     }
@@ -282,8 +509,9 @@ static void handle_client(int fd, const char *ip, int port)
 /* One thread per client connection. */
 static void *client_thread(void *p)
 {
+
     struct client_arg *a = (struct client_arg *)p;
-    pthread_detach(pthread_self());     /* resources freed automatically */
+    pthread_detach(pthread_self());
     handle_client(a->fd, a->ip, a->port);
     free(a);
     return NULL;
@@ -295,6 +523,8 @@ int main(void)
 
     logfp = fopen(LOGFILE, "a");
     if (!logfp) { perror("log file"); return 1; }
+
+    if (make_store_dir() < 0) { perror("storage directory"); return 1; }
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("socket"); return 1; }
@@ -318,7 +548,7 @@ int main(void)
     }
 
     printf("RemoteOps Agent listening on port %d\n", PORT);
-    log_event("Agent started, listening on port %d", PORT);
+    log_event("Agent started, listening on port %d, storage %s", PORT, STORE_DIR);
 
     while (1) {
         struct sockaddr_in cli;
