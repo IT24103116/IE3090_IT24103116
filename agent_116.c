@@ -56,11 +56,19 @@ static double now_sec(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+struct monitor {
+    pthread_t          th;
+    int                running;   /* 1 while the sender thread exists */
+    int                stop;      /* set to 1 to ask the thread to finish */
+    struct sockaddr_in dest;      /* controller IP + UDP port */
+};
+
 struct conn {
     int    fd;
     char   buf[BUFSZ];   /* bytes received but not yet consumed */
     size_t len;
     int    authed;
+    struct monitor mon;   /* UDP monitoring state for this session */
 };
 
 struct client_arg {
@@ -274,6 +282,89 @@ static void handle_exec(struct conn *c, const char *name)
     reply(c, "ERR 002 COMMAND_NOT_ALLOWED");
 }
 
+/* ---------- MONITOR: periodic UDP system-stats stream ---------- */
+#define MON_INTERVAL_MS 2000   /* one datagram every 2 seconds */
+
+static void *monitor_thread(void *p)
+{
+    struct monitor *m = (struct monitor *)p;
+    int us = socket(AF_INET, SOCK_DGRAM, 0);
+    if (us < 0) return NULL;
+
+    while (!__atomic_load_n(&m->stop, __ATOMIC_ACQUIRE)) {
+        char info[256], msg[300];
+        get_sysinfo(info, sizeof(info));
+        int n = snprintf(msg, sizeof(msg), "%s SID:%s", info, SID);
+        if (n > 0 && n < (int)sizeof(msg))
+            sendto(us, msg, (size_t)n, 0,
+                   (struct sockaddr *)&m->dest, sizeof(m->dest));
+
+        /* sleep in 100 ms slices so MONITOR STOP takes effect quickly */
+        for (int i = 0; i < MON_INTERVAL_MS / 100; i++) {
+            if (__atomic_load_n(&m->stop, __ATOMIC_ACQUIRE)) break;
+            struct timespec ts = { 0, 100 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+        }
+    }
+    close(us);
+    return NULL;
+}
+
+/* Stop this session's UDP stream (safe to call when none is running). */
+static void monitor_stop(struct conn *c)
+{
+    if (!c->mon.running) return;
+    __atomic_store_n(&c->mon.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(c->mon.th, NULL);
+    c->mon.running = 0;
+}
+
+/* MONITOR START <udp_port> / MONITOR STOP */
+static void handle_monitor(struct conn *c, const char *ip, int tcp_port, const char *args)
+{
+    char sub[16] = "", portstr[16] = "", extra[8];
+    int n = sscanf(args, "%15s %15s %7s", sub, portstr, extra);
+
+    if (strcmp(sub, "START") == 0 && n == 2) {
+        char *end;
+        long port = strtol(portstr, &end, 10);
+        if (*end != '\0' || port < 1 || port > 65535) {
+            reply(c, "ERR 007 BAD_REQUEST");
+            return;
+        }
+        if (c->mon.running) {
+            reply(c, "ERR 009 MONITOR_ALREADY_RUNNING");
+            return;
+        }
+        memset(&c->mon.dest, 0, sizeof(c->mon.dest));
+        c->mon.dest.sin_family = AF_INET;
+        c->mon.dest.sin_port = htons((unsigned short)port);
+        if (inet_pton(AF_INET, ip, &c->mon.dest.sin_addr) != 1) {
+            reply(c, "ERR 007 BAD_REQUEST");
+            return;
+        }
+        c->mon.stop = 0;
+        if (pthread_create(&c->mon.th, NULL, monitor_thread, &c->mon) != 0) {
+            reply(c, "ERR 011 MONITOR_FAILED");
+            return;
+        }
+        c->mon.running = 1;
+        log_event("[%s:%d] MONITOR started, UDP to port %ld", ip, tcp_port, port);
+        reply(c, "OK MONITOR_STARTED");
+    } else if (strcmp(sub, "STOP") == 0 && n == 1) {
+        if (!c->mon.running) {
+            reply(c, "ERR 010 MONITOR_NOT_RUNNING");
+            return;
+        }
+        monitor_stop(c);
+        log_event("[%s:%d] MONITOR stopped", ip, tcp_port);
+        reply(c, "OK MONITOR_STOPPED");
+    } else {
+        reply(c, "ERR 007 BAD_REQUEST");
+    }
+}
+
+
 /* ---------- file transfer helpers ---------- */
 static int make_store_dir(void)
 {
@@ -485,6 +576,8 @@ static void handle_client(int fd, const char *ip, int port)
             reply(&c, msg);
         } else if (strncmp(line, "EXEC ", 5) == 0) {
             handle_exec(&c, line + 5);
+        } else if (strncmp(line, "MONITOR ", 8) == 0) {
+            handle_monitor(&c, ip, port, line + 8);
         } else if (strncmp(line, "PUT ", 4) == 0) {
             if (handle_put(&c, ip, port, line + 4) < 0) { r = -1; break; }
         } else if (strncmp(line, "GET ", 4) == 0) {
@@ -493,6 +586,8 @@ static void handle_client(int fd, const char *ip, int port)
             reply(&c, "ERR 099 UNKNOWN_COMMAND");
         }
     }
+
+    monitor_stop(&c);   /* QUIT, disconnect or error: stop the UDP stream too */
 
     if (r == 0) {
         printf("[%s:%d] client disconnected\n", ip, port);

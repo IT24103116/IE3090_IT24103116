@@ -4,6 +4,8 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <pthread.h>
+#include <sys/time.h>
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -235,6 +237,99 @@ static int do_get(struct sock *s, const char *name)
     return 0;
 }
 
+/* ---------- UDP monitoring receiver ---------- */
+static int       udp_fd = -1;
+static pthread_t udp_th;
+static int       udp_running = 0;
+static int       udp_quit = 0;
+
+static void *udp_thread(void *arg)
+{
+    (void)arg;
+    char msg[512];
+    while (!__atomic_load_n(&udp_quit, __ATOMIC_ACQUIRE)) {
+        ssize_t n = recvfrom(udp_fd, msg, sizeof(msg) - 1, 0, NULL, NULL);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+            break;
+        }
+        msg[n] = '\0';
+        printf("[UDP] %s\n", msg);
+    }
+    return NULL;
+}
+
+static void udp_stop(void)
+{
+    if (!udp_running) return;
+    __atomic_store_n(&udp_quit, 1, __ATOMIC_RELEASE);
+    pthread_join(udp_th, NULL);
+    close(udp_fd);
+    udp_fd = -1;
+    udp_running = 0;
+}
+
+static int udp_start(int port)
+{
+    udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_fd < 0) { perror("udp socket"); return -1; }
+
+    int opt = 1;
+    setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct timeval tv = { 0, 500000 };   /* wake up every 0.5 s to check udp_quit */
+    setsockopt(udp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_port = htons((unsigned short)port);
+    if (bind(udp_fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+        perror("udp bind");
+        close(udp_fd);
+        udp_fd = -1;
+        return -1;
+    }
+
+    udp_quit = 0;
+    if (pthread_create(&udp_th, NULL, udp_thread, NULL) != 0) {
+        perror("pthread_create");
+        close(udp_fd);
+        udp_fd = -1;
+        return -1;
+    }
+    udp_running = 1;
+    return 0;
+}
+
+/* MONITOR START <udp_port>: listen on the UDP port first, then ask the agent. */
+static int do_monitor_start(struct sock *s, const char *portstr)
+{
+    char *end;
+    long port = strtol(portstr, &end, 10);
+    if (*portstr == '\0' || *end != '\0' || port < 1 || port > 65535) {
+        printf("MONITOR START: give a UDP port number, e.g. MONITOR START 9999\n");
+        return 0;
+    }
+    if (udp_running) {
+        printf("Already listening on a UDP port; send MONITOR STOP first\n");
+        return 0;
+    }
+    if (udp_start((int)port) < 0) return 0;
+
+    char cmd[64];
+    int n = snprintf(cmd, sizeof(cmd), "MONITOR START %ld\n", port);
+    if (send_all(s->fd, cmd, (size_t)n) < 0) { udp_stop(); return -1; }
+
+    char line[BUFSZ];
+    if (read_line(s, line, sizeof(line)) <= 0) { udp_stop(); return -1; }
+    puts(line);
+    if (strncmp(line, "OK ", 3) != 0)
+        udp_stop();   /* the agent refused, so no stream is coming */
+    return 0;
+}
+
+
 int main(int argc, char *argv[])
 {
     const char *host = (argc > 1) ? argv[1] : "127.0.0.1";
@@ -266,7 +361,9 @@ int main(int argc, char *argv[])
         if (input[0] == '\0') continue;
 
         int rc;
-        if (strncmp(input, "PUT ", 4) == 0)
+        if (strncmp(input, "MONITOR START ", 14) == 0)
+            rc = do_monitor_start(&s, input + 14);
+        else if (strncmp(input, "PUT ", 4) == 0)
             rc = do_put(&s, input + 4);
         else if (strncmp(input, "GET ", 4) == 0)
             rc = do_get(&s, input + 4);
@@ -277,9 +374,12 @@ int main(int argc, char *argv[])
             printf("Connection to agent lost\n");
             break;
         }
+        if (strcmp(input, "MONITOR STOP") == 0)
+            udp_stop();
         if (strcmp(input, "QUIT") == 0) break;
     }
 
+    udp_stop();
     close(s.fd);
     return 0;
 }
